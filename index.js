@@ -1,29 +1,31 @@
 require("dotenv").config();
+const http = require("http");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-const http = require("http");
 
-/* ========= HTTP SERVER (UptimeRobot) ========= */
-const PORT = process.env.PORT || 3000;
+/* ================= HTTP SERVER (Render + UptimeRobot) ================= */
+const PORT = process.env.PORT || 10000;
+
 http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/plain");
   res.end("OK");
-}).listen(PORT, () => {
-  console.log(`🌐 Health check server running on port ${PORT}`);
+}).listen(PORT, "0.0.0.0", () => {
+  console.log(`🌐 Server listening on port ${PORT}`);
 });
 
-/* ========= TELEGRAM BOT ========= */
+/* ================= TELEGRAM BOT ================= */
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
   polling: true
 });
 
 console.log("🤖 Telegram AI Bot is running...");
 
-/* ========= MEMORY (CONTEXT) ========= */
-const conversations = {}; // chatId -> [{role,text}]
+/* ================= MEMORY ================= */
+const conversations = {};
 const MAX_HISTORY = 10;
 
-/* ========= MESSAGE HANDLER ========= */
+/* ================= HANDLER ================= */
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const userText = msg.text || msg.caption || "";
@@ -31,82 +33,61 @@ bot.on("message", async (msg) => {
   if (!conversations[chatId]) conversations[chatId] = [];
 
   try {
-    /* ----- IMAGE (with or without text) ----- */
+    // ----- IMAGE -----
     if (msg.photo) {
-      await bot.sendMessage(chatId, "📸 وصلت الصورة، جاري التحليل...");
-
       const fileId = msg.photo[msg.photo.length - 1].file_id;
       const file = await bot.getFile(fileId);
       const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
 
-      const imageRes = await axios.get(fileUrl, { responseType: "arraybuffer" });
-      const imageBase64 = Buffer.from(imageRes.data).toString("base64");
+      const img = await axios.get(fileUrl, { responseType: "arraybuffer" });
+      const imageBase64 = Buffer.from(img.data).toString("base64");
 
-      saveToMemory(chatId, "user", userText || "[صورة]");
+      save(chatId, "user", userText || "[image]");
 
-      const answer = await askGemini({
-        chatId,
-        text: userText,
-        imageBase64
-      });
+      const answer = await askGemini(chatId, userText, imageBase64);
+      save(chatId, "assistant", answer);
 
-      saveToMemory(chatId, "assistant", answer);
-      await sendLongMessage(chatId, answer);
+      await sendLong(chatId, answer);
       return;
     }
 
-    /* ----- TEXT ONLY ----- */
+    // ----- TEXT -----
     if (msg.text) {
-      saveToMemory(chatId, "user", msg.text);
+      save(chatId, "user", msg.text);
 
-      const answer = await askGemini({
-        chatId,
-        text: msg.text
-      });
+      const answer = await askGemini(chatId, msg.text, null);
+      save(chatId, "assistant", answer);
 
-      saveToMemory(chatId, "assistant", answer);
-      await sendLongMessage(chatId, answer);
+      await sendLong(chatId, answer);
       return;
     }
 
-    await bot.sendMessage(chatId, "❓ ابعث نص أو صورة");
-
-  } catch (err) {
-    console.error("❌ Error:", err.response?.data || err.message);
-    await bot.sendMessage(chatId, "❌ صار خطأ أثناء المعالجة");
+  } catch (e) {
+    await bot.sendMessage(chatId, "❌ خطأ");
   }
 });
 
-/* ========= GEMINI ========= */
-async function askGemini({ chatId, text = "", imageBase64 = null }) {
+/* ================= GEMINI ================= */
+async function askGemini(chatId, text, imageBase64) {
   const parts = [];
 
-  // تعليمات ثابتة
   parts.push({
     text: `
-أنت مساعد ذكي في محادثة مستمرة.
-تذكر ما قيل سابقًا.
 أجب كنص عادي فقط.
-لا تستخدم LaTeX.
-لا تستخدم Markdown.
-لا تستخدم رموز مثل $ أو ---.
-اكتب جواب واضح ومباشر مناسب لتلغرام.
+لا Markdown.
+لا LaTeX.
+تذكّر سياق المحادثة.
 `
   });
 
-  // السياق السابق
-  conversations[chatId].forEach((m) => {
+  conversations[chatId].forEach(m => {
     parts.push({
       text: `${m.role === "user" ? "المستخدم" : "المساعد"}: ${m.text}`
     });
   });
 
-  // السؤال الحالي
-  parts.push({
-    text: `المستخدم الآن: ${text || "اشرح محتوى الصورة"}`
-  });
+  parts.push({ text: `المستخدم الآن: ${text || "اشرح الصورة"}` });
 
-  // الصورة إن وُجدت
   if (imageBase64) {
     parts.push({
       inline_data: {
@@ -125,18 +106,14 @@ async function askGemini({ chatId, text = "", imageBase64 = null }) {
   return res.data.candidates[0].content.parts[0].text;
 }
 
-/* ========= MEMORY ========= */
-function saveToMemory(chatId, role, text) {
+/* ================= HELPERS ================= */
+function save(chatId, role, text) {
   conversations[chatId].push({ role, text });
-  if (conversations[chatId].length > MAX_HISTORY) {
-    conversations[chatId].shift();
-  }
+  if (conversations[chatId].length > MAX_HISTORY) conversations[chatId].shift();
 }
 
-/* ========= LONG MESSAGE SPLIT ========= */
-async function sendLongMessage(chatId, text) {
-  const MAX = 4000;
-  for (let i = 0; i < text.length; i += MAX) {
-    await bot.sendMessage(chatId, text.substring(i, i + MAX));
+async function sendLong(chatId, text) {
+  for (let i = 0; i < text.length; i += 4000) {
+    await bot.sendMessage(chatId, text.substring(i, i + 4000));
   }
 }
