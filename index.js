@@ -3,16 +3,14 @@ const http = require("http");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 
-/* ================= HTTP SERVER (Render + UptimeRobot) ================= */
+/* ================= HTTP SERVER ================= */
 const PORT = process.env.PORT || 10000;
 
 http.createServer((req, res) => {
   res.statusCode = 200;
   res.setHeader("Content-Type", "text/plain");
   res.end("OK");
-}).listen(PORT, "0.0.0.0", () => {
-  console.log(`🌐 Server listening on port ${PORT}`);
-});
+}).listen(PORT, "0.0.0.0");
 
 /* ================= TELEGRAM BOT ================= */
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
@@ -20,20 +18,24 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
 });
 
 console.log("🤖 Telegram AI Bot is running...");
+console.log(`🌐 Server listening on port ${PORT}`);
 
 /* ================= MEMORY ================= */
 const conversations = {};
 const MAX_HISTORY = 10;
 
-/* ================= HANDLER ================= */
+/* ================= MESSAGE HANDLER ================= */
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
-  const userText = msg.text || msg.caption || "";
+  const userText = (msg.text || msg.caption || "").trim();
 
   if (!conversations[chatId]) conversations[chatId] = [];
 
   try {
-    // ----- IMAGE -----
+    /* تجاهل الرسائل غير النصية */
+    if (!msg.text && !msg.photo) return;
+
+    /* ===== IMAGE ===== */
     if (msg.photo) {
       const fileId = msg.photo[msg.photo.length - 1].file_id;
       const file = await bot.getFile(fileId);
@@ -51,19 +53,19 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // ----- TEXT -----
-    if (msg.text) {
-      save(chatId, "user", msg.text);
+    /* ===== TEXT ===== */
+    if (userText.length > 0) {
+      save(chatId, "user", userText);
 
-      const answer = await askGemini(chatId, msg.text, null);
+      const answer = await askGemini(chatId, userText, null);
       save(chatId, "assistant", answer);
 
       await sendLong(chatId, answer);
-      return;
     }
 
   } catch (e) {
-    await bot.sendMessage(chatId, "❌ خطأ");
+    console.error("Bot error:", e?.response?.data || e.message);
+    await bot.sendMessage(chatId, "صار تأخير بسيط، ابعث سؤالك مرة ثانية 🌱");
   }
 });
 
@@ -76,7 +78,7 @@ async function askGemini(chatId, text, imageBase64) {
 أجب كنص عادي فقط.
 لا Markdown.
 لا LaTeX.
-تذكّر سياق المحادثة.
+تذكر سياق المحادثة.
 `
   });
 
@@ -86,7 +88,9 @@ async function askGemini(chatId, text, imageBase64) {
     });
   });
 
-  parts.push({ text: `المستخدم الآن: ${text || "اشرح الصورة"}` });
+  parts.push({
+    text: `المستخدم الآن: ${text || "اشرح محتوى الصورة"}`
+  });
 
   if (imageBase64) {
     parts.push({
@@ -103,13 +107,22 @@ async function askGemini(chatId, text, imageBase64) {
     { params: { key: process.env.GOOGLE_API_KEY } }
   );
 
-  return res.data.candidates[0].content.parts[0].text;
+  const reply =
+    res?.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+  if (!reply || reply.trim() === "") {
+    return "ما قدرت أفهم السؤال، ممكن توضحه أكثر؟";
+  }
+
+  return reply;
 }
 
 /* ================= HELPERS ================= */
 function save(chatId, role, text) {
   conversations[chatId].push({ role, text });
-  if (conversations[chatId].length > MAX_HISTORY) conversations[chatId].shift();
+  if (conversations[chatId].length > MAX_HISTORY) {
+    conversations[chatId].shift();
+  }
 }
 
 async function sendLong(chatId, text) {
