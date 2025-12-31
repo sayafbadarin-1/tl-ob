@@ -7,8 +7,7 @@ const axios = require("axios");
 const PORT = process.env.PORT || 10000;
 
 http.createServer((req, res) => {
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "text/plain");
+  res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("OK");
 }).listen(PORT, "0.0.0.0");
 
@@ -27,13 +26,19 @@ const MAX_HISTORY = 10;
 /* ================= MESSAGE HANDLER ================= */
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
-  const userText = (msg.text || msg.caption || "").trim();
+  const text = (msg.text || msg.caption || "").trim();
 
   if (!conversations[chatId]) conversations[chatId] = [];
 
   try {
-    /* تجاهل الرسائل غير النصية */
+    // تجاهل أي شيء غير نص أو صورة
     if (!msg.text && !msg.photo) return;
+
+    // تجاهل النصوص القصيرة جدًا (مثل: 👍 ، ؟ ، hi)
+    if (msg.text && text.length < 3) {
+      await bot.sendMessage(chatId, "اكتب سؤالك بشكل أوضح ✍️");
+      return;
+    }
 
     /* ===== IMAGE ===== */
     if (msg.photo) {
@@ -44,77 +49,85 @@ bot.on("message", async (msg) => {
       const img = await axios.get(fileUrl, { responseType: "arraybuffer" });
       const imageBase64 = Buffer.from(img.data).toString("base64");
 
-      save(chatId, "user", userText || "[image]");
+      save(chatId, "user", text || "[image]");
 
-      const answer = await askGemini(chatId, userText, imageBase64);
+      const answer = await askGemini(chatId, text, imageBase64);
+      if (!answer) return;
+
       save(chatId, "assistant", answer);
-
       await sendLong(chatId, answer);
       return;
     }
 
     /* ===== TEXT ===== */
-    if (userText.length > 0) {
-      save(chatId, "user", userText);
+    if (msg.text) {
+      save(chatId, "user", text);
 
-      const answer = await askGemini(chatId, userText, null);
+      const answer = await askGemini(chatId, text, null);
+      if (!answer) {
+        await bot.sendMessage(chatId, "ما قدرت أفهم سؤالك، ممكن توضحه أكثر؟");
+        return;
+      }
+
       save(chatId, "assistant", answer);
-
       await sendLong(chatId, answer);
     }
 
   } catch (e) {
+    // نسجل الخطأ فقط بدون إزعاج المستخدم
     console.error("Bot error:", e?.response?.data || e.message);
-    await bot.sendMessage(chatId, "صار تأخير بسيط، ابعث سؤالك مرة ثانية 🌱");
   }
 });
 
 /* ================= GEMINI ================= */
 async function askGemini(chatId, text, imageBase64) {
-  const parts = [];
+  try {
+    const parts = [];
 
-  parts.push({
-    text: `
+    parts.push({
+      text: `
 أجب كنص عادي فقط.
 لا Markdown.
 لا LaTeX.
 تذكر سياق المحادثة.
 `
-  });
-
-  conversations[chatId].forEach(m => {
-    parts.push({
-      text: `${m.role === "user" ? "المستخدم" : "المساعد"}: ${m.text}`
     });
-  });
 
-  parts.push({
-    text: `المستخدم الآن: ${text || "اشرح محتوى الصورة"}`
-  });
-
-  if (imageBase64) {
-    parts.push({
-      inline_data: {
-        mime_type: "image/jpeg",
-        data: imageBase64
-      }
+    conversations[chatId].forEach(m => {
+      parts.push({
+        text: `${m.role === "user" ? "المستخدم" : "المساعد"}: ${m.text}`
+      });
     });
+
+    parts.push({
+      text: `المستخدم الآن: ${text || "اشرح محتوى الصورة"}`
+    });
+
+    if (imageBase64) {
+      parts.push({
+        inline_data: {
+          mime_type: "image/jpeg",
+          data: imageBase64
+        }
+      });
+    }
+
+    const res = await axios.post(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+      { contents: [{ parts }] },
+      { params: { key: process.env.GOOGLE_API_KEY }, timeout: 20000 }
+    );
+
+    const reply =
+      res?.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    return reply && reply.trim() !== "" ? reply : null;
+
+  } catch (e) {
+    // فشل Gemini → نرجع null بدون رسالة مزعجة
+    console.error("Gemini error:", e?.response?.data || e.message);
+    return null;
   }
-
-  const res = await axios.post(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-    { contents: [{ parts }] },
-    { params: { key: process.env.GOOGLE_API_KEY } }
-  );
-
-  const reply =
-    res?.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-  if (!reply || reply.trim() === "") {
-    return "ما قدرت أفهم السؤال، ممكن توضحه أكثر؟";
-  }
-
-  return reply;
 }
 
 /* ================= HELPERS ================= */
